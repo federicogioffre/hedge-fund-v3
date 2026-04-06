@@ -1,0 +1,3 @@
+MODEL_VERSION = "v3.0"
+DATA_VERSION = "bundle_v1"
+APP_VERSION = "3.0.0"
