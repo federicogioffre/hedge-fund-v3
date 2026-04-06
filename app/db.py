@@ -45,3 +45,39 @@ def get_db() -> Session:
         raise
     finally:
         session.close()
+
+
+def get_recent_signal_history(
+    session: Session,
+    ticker: str,
+    agent_name: str,
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Load recent signal history for a ticker+agent pair.
+    Ordered by created_at DESC, returns list of dicts.
+    """
+    from app.models import SignalHistory
+
+    records = (
+        session.query(SignalHistory)
+        .filter_by(ticker=ticker.upper(), agent_name=agent_name)
+        .order_by(SignalHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "id": r.id,
+            "ticker": r.ticker,
+            "agent_name": r.agent_name,
+            "score": r.score,
+            "confidence": r.confidence,
+            "risk": r.risk,
+            "momentum": r.momentum,
+            "acceleration": r.acceleration,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in records
+    ]

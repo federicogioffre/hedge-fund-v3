@@ -5,12 +5,15 @@ from typing import Any
 from app.data_bundle import DataBundle
 from app.agents import AGENTS, PORTFOLIO_AGENT, AgentResult
 from app.signal_blender import blend_signals
+from app.signal_temporal import compute_signal_momentum, apply_temporal_adjustment
 from app.risk_engine import compute_risk
+from app.regime import detect_regime
+from app.strategy_engine import blend_strategy
 from app.cache import get_cached_analysis, set_cached_analysis
 from app.context import AnalysisContext
 from app.version import MODEL_VERSION, DATA_VERSION
-from app.db import get_db
-from app.models import AnalysisResult, AuditLog
+from app.db import get_db, get_recent_signal_history
+from app.models import AnalysisResult, AuditLog, SignalHistory, Snapshot
 from app.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,7 +21,16 @@ logger = get_logger(__name__)
 
 async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
     """
-    V5 Pipeline: DataBundle → Agents → SignalBlender → RiskEngine → Portfolio → Report
+    V5.1 Pipeline:
+        1. DataBundle
+        2. Agents (with timeout)
+        3. Load SignalHistory → Temporal adjustment
+        4. Signal Blender
+        5. Regime Detection
+        6. Risk Engine
+        7. Strategy Blending
+        8. Portfolio Agent
+        9. Final Report
     """
     ticker = ctx.ticker.upper()
     request_id = ctx.request_id
@@ -46,7 +58,6 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
     agent_tasks = [agent.safe_analyze(bundle) for agent in AGENTS]
     agent_results_raw = await asyncio.gather(*agent_tasks, return_exceptions=True)
 
-    # Filter out exceptions (safe_analyze should handle them, but belt-and-suspenders)
     agent_results: list[AgentResult] = []
     for r in agent_results_raw:
         if isinstance(r, AgentResult):
@@ -54,19 +65,78 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
         else:
             logger.error("agent_gather_exception", error=str(r))
 
-    # 3. Signal Blender
-    blended = blend_signals(agent_results)
+    # 3. Load SignalHistory + Temporal adjustment
+    temporal_data = {"momentum": 0.0, "acceleration": 0.0, "stability": 0.0}
+    try:
+        with get_db() as session:
+            # Aggregate history across all agents for this ticker
+            all_history = []
+            for agent in AGENTS:
+                history = get_recent_signal_history(
+                    session, ticker, agent.name, limit=5
+                )
+                all_history.extend(history)
 
-    # 4. Risk Engine
-    risk_metrics = compute_risk(bundle, agent_results)
+            if all_history:
+                temporal_data = compute_signal_momentum(all_history)
+    except Exception as e:
+        logger.warning("signal_history_load_error", error=str(e))
 
-    # 5. Portfolio agent aggregation
-    portfolio = PORTFOLIO_AGENT.analyze_portfolio(agent_results)
+    # Apply temporal adjustment to each agent result
+    adjusted_results = []
+    for r in agent_results:
+        adj = apply_temporal_adjustment(r.score, r.confidence, temporal_data)
+        adjusted_r = AgentResult(
+            agent_name=r.agent_name,
+            score=adj["adjusted_score"],
+            confidence=adj["adjusted_confidence"],
+            risk=r.risk,
+            reasoning=r.reasoning,
+            metadata={
+                **r.metadata,
+                "temporal_adjusted": True,
+                "original_score": r.score,
+                "original_confidence": r.confidence,
+            },
+        )
+        adjusted_results.append(adjusted_r)
 
-    # 6. Build report
+    # 4. Signal Blender (on adjusted results)
+    blended = blend_signals(adjusted_results)
+
+    # 5. Regime Detection
+    regime = detect_regime(bundle)
+
+    # 6. Risk Engine
+    risk_metrics = compute_risk(bundle, adjusted_results)
+
+    # 7. Strategy Blending
+    strategy = blend_strategy(
+        score=blended["score"],
+        confidence=blended["confidence"],
+        regime=regime,
+        risk_score=risk_metrics["risk_score"],
+    )
+
+    # 8. Portfolio agent aggregation
+    portfolio = PORTFOLIO_AGENT.analyze_portfolio(adjusted_results)
+
+    # Enhanced conviction: adjusted_score * adjusted_confidence * (1 - risk) * (1 + momentum)
+    momentum = temporal_data.get("momentum", 0.0)
+    conviction = round(
+        strategy["adjusted_score"]
+        * blended["confidence"]
+        * (1 - risk_metrics["risk_score"])
+        * (1 + max(-0.5, min(0.5, momentum))),  # clamp momentum effect
+        3,
+    )
+
+    # 9. Build report
     duration_ms = round((time.time() - start) * 1000, 2)
     report = _build_report(
-        ticker, asset_type, agent_results, blended, risk_metrics, portfolio, duration_ms
+        ticker, asset_type, agent_results, adjusted_results,
+        blended, temporal_data, regime, risk_metrics, strategy,
+        portfolio, conviction, duration_ms,
     )
 
     result = {
@@ -76,17 +146,25 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
         "status": "completed",
         "overall_score": portfolio["overall_score"],
         "confidence": portfolio["confidence"],
-        "conviction": portfolio["conviction"],
+        "conviction": conviction,
         "recommendation": portfolio["recommendation"],
         "blended_score": blended["score"],
+        "strategy_score": strategy["adjusted_score"],
         "dispersion": blended["dispersion"],
         "risk_score": risk_metrics["risk_score"],
         "volatility": risk_metrics["volatility"],
         "var_95": risk_metrics["var_95"],
         "max_drawdown_est": risk_metrics["max_drawdown_est"],
+        "momentum": temporal_data["momentum"],
+        "acceleration": temporal_data["acceleration"],
+        "stability": temporal_data["stability"],
+        "regime": regime,
+        "strategy": strategy,
         "agent_results": [r.to_dict() for r in agent_results],
+        "adjusted_agent_results": [r.to_dict() for r in adjusted_results],
         "signal_blend": blended,
         "risk_metrics": risk_metrics,
+        "temporal_data": temporal_data,
         "report": report,
         "model_version": MODEL_VERSION,
         "data_version": DATA_VERSION,
@@ -94,13 +172,19 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
         "completed_at": datetime.utcnow().isoformat(),
     }
 
-    # 7. Save to DB
+    # 10. Save to DB
     _save_result(result)
 
-    # 8. Audit trail
+    # 11. Save signal history
+    _save_signal_history(request_id, ticker, adjusted_results, temporal_data)
+
+    # 12. Save snapshot
+    _save_snapshot(ticker, bundle, result)
+
+    # 13. Audit trail
     _save_audit(request_id, ticker, agent_results, duration_ms)
 
-    # 9. Cache result
+    # 14. Cache result
     set_cached_analysis(ticker, result)
 
     logger.info(
@@ -109,8 +193,11 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
         request_id=request_id,
         score=portfolio["overall_score"],
         blended_score=blended["score"],
+        strategy_score=strategy["adjusted_score"],
         risk_score=risk_metrics["risk_score"],
-        conviction=portfolio["conviction"],
+        conviction=conviction,
+        momentum=temporal_data["momentum"],
+        regime=regime["market_regime"],
         recommendation=portfolio["recommendation"],
         duration_ms=duration_ms,
     )
@@ -121,33 +208,52 @@ async def run_analysis(ctx: AnalysisContext) -> dict[str, Any]:
 def _build_report(
     ticker: str,
     asset_type: str,
-    agent_results: list[AgentResult],
+    raw_results: list[AgentResult],
+    adjusted_results: list[AgentResult],
     blended: dict[str, Any],
+    temporal: dict[str, Any],
+    regime: dict[str, Any],
     risk_metrics: dict[str, Any],
+    strategy: dict[str, Any],
     portfolio: dict[str, Any],
+    conviction: float,
     duration_ms: float,
 ) -> str:
     lines = [
-        f"=== Hedge Fund V5 Analysis Report ===",
+        f"=== Hedge Fund V5.1 Analysis Report ===",
         f"Ticker: {ticker} ({asset_type})",
         f"Model: {MODEL_VERSION} | Data: {DATA_VERSION}",
         f"",
-        f"--- Agent Scores ---",
+        f"--- Agent Scores (raw → adjusted) ---",
     ]
-    for r in agent_results:
-        fallback = " [FALLBACK]" if r.metadata.get("fallback") else ""
+    for raw, adj in zip(raw_results, adjusted_results):
+        fallback = " [FALLBACK]" if raw.metadata.get("fallback") else ""
         lines.append(
-            f"  {r.agent_name:15s}: score={r.score:.1f}  "
-            f"conf={r.confidence:.2f}  risk={r.risk:.2f}{fallback}"
+            f"  {raw.agent_name:15s}: {raw.score:.1f}→{adj.score:.1f}  "
+            f"conf={raw.confidence:.2f}→{adj.confidence:.2f}  "
+            f"risk={raw.risk:.2f}{fallback}"
         )
-        lines.append(f"    → {r.reasoning}")
+        lines.append(f"    → {raw.reasoning}")
 
     lines.extend([
+        f"",
+        f"--- Temporal Intelligence ---",
+        f"  Momentum:         {temporal['momentum']}",
+        f"  Acceleration:     {temporal['acceleration']}",
+        f"  Stability:        {temporal['stability']}",
         f"",
         f"--- Signal Blend ---",
         f"  Blended Score:    {blended['score']}",
         f"  Blended Conf:     {blended['confidence']}",
         f"  Dispersion:       {blended['dispersion']}",
+        f"",
+        f"--- Regime ---",
+        f"  Market:           {regime['market_regime']}",
+        f"  Volatility:       {regime['vol_regime']}",
+        f"",
+        f"--- Strategy ---",
+        f"  Strategy Score:   {strategy['adjusted_score']}",
+        f"  Weights:          {strategy['strategy_weights']}",
         f"",
         f"--- Risk Metrics ---",
         f"  Risk Score:       {risk_metrics['risk_score']}",
@@ -158,7 +264,7 @@ def _build_report(
         f"--- Portfolio Summary ---",
         f"  Overall Score:    {portfolio['overall_score']}",
         f"  Confidence:       {portfolio['confidence']}",
-        f"  Conviction:       {portfolio['conviction']}",
+        f"  Conviction:       {conviction}",
         f"  Recommendation:   {portfolio['recommendation'].upper()}",
         f"",
         f"Duration: {duration_ms}ms",
@@ -187,6 +293,54 @@ def _save_result(result: dict[str, Any]) -> None:
             session.add(record)
     except Exception as e:
         logger.error("db_save_error", error=str(e))
+
+
+def _save_signal_history(
+    request_id: str,
+    ticker: str,
+    agent_results: list[AgentResult],
+    temporal_data: dict[str, Any],
+) -> None:
+    try:
+        with get_db() as session:
+            for r in agent_results:
+                record = SignalHistory(
+                    ticker=ticker,
+                    agent_name=r.agent_name,
+                    score=r.score,
+                    confidence=r.confidence,
+                    risk=r.risk,
+                    momentum=temporal_data.get("momentum"),
+                    acceleration=temporal_data.get("acceleration"),
+                    request_id=request_id,
+                )
+                session.add(record)
+    except Exception as e:
+        logger.error("signal_history_save_error", error=str(e))
+
+
+def _save_snapshot(
+    ticker: str,
+    bundle: DataBundle,
+    result: dict[str, Any],
+) -> None:
+    try:
+        with get_db() as session:
+            snapshot = Snapshot(
+                ticker=ticker,
+                horizon="default",
+                data_json={
+                    "bundle": bundle.to_dict(),
+                    "blended_score": result.get("blended_score"),
+                    "risk_score": result.get("risk_score"),
+                    "conviction": result.get("conviction"),
+                    "regime": result.get("regime"),
+                },
+                model_version=MODEL_VERSION,
+            )
+            session.add(snapshot)
+    except Exception as e:
+        logger.error("snapshot_save_error", error=str(e))
 
 
 def _save_audit(

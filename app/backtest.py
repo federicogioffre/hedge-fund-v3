@@ -7,6 +7,8 @@ from app.logging import get_logger
 
 logger = get_logger(__name__)
 
+TRANSACTION_COST = 0.001  # 0.1% per trade
+
 
 def run_backtest_v2(
     tickers: list[str],
@@ -14,12 +16,12 @@ def run_backtest_v2(
     capital: float = 100_000.0,
 ) -> dict[str, Any]:
     """
-    Backtesting engine V2.
+    Backtesting engine V2 with transaction costs and slippage.
 
     For each day:
         1. Generate simulated ranking for each ticker
         2. Construct portfolio
-        3. Simulate daily return
+        3. Simulate daily return minus costs
 
     Returns:
         total_return, sharpe_ratio, max_drawdown, win_rate
@@ -29,6 +31,8 @@ def run_backtest_v2(
     peak_value = capital
     max_drawdown = 0.0
     winning_days = 0
+    total_costs = 0.0
+    prev_positions: set[str] = set()
 
     for day in range(days):
         # 1. Generate simulated ranking for the day
@@ -65,6 +69,25 @@ def run_backtest_v2(
         # 2. Construct portfolio
         portfolio = construct_portfolio(rankings, portfolio_value)
 
+        # Track position changes for transaction costs
+        current_positions = {p["ticker"] for p in portfolio["positions"]}
+        new_entries = current_positions - prev_positions
+        exits = prev_positions - current_positions
+        turnover_count = len(new_entries) + len(exits)
+
+        # Transaction cost for trades
+        day_tx_cost = 0.0
+        for pos in portfolio["positions"]:
+            if pos["ticker"] in new_entries:
+                day_tx_cost += pos["allocation"] * TRANSACTION_COST
+
+        # Exit costs
+        if exits and prev_positions:
+            exit_alloc = portfolio_value * 0.05 * len(exits)  # estimate
+            day_tx_cost += exit_alloc * TRANSACTION_COST
+
+        total_costs += day_tx_cost
+
         # 3. Simulate daily return for each position
         daily_pnl = 0.0
         for pos in portfolio["positions"]:
@@ -75,14 +98,24 @@ def run_backtest_v2(
                 16,
             )
             rng = random.Random(seed)
-            # Daily return: slight positive bias, scaled by score
-            base_return = (rng.gauss(0.001, 0.02))
+
+            # Base return with slight positive bias
+            base_return = rng.gauss(0.001, 0.02)
             score_adj = (pos["score"] - 3.0) * 0.002
-            daily_ticker_return = base_return + score_adj
+
+            # Slippage: volatility-based
+            volatility_est = abs(base_return) + 0.01
+            slippage = volatility_est * 0.1
+            daily_ticker_return = base_return + score_adj - slippage
+
             daily_pnl += pos["allocation"] * daily_ticker_return
 
+        # Subtract transaction costs
+        daily_pnl -= day_tx_cost
+
+        prev_value = portfolio_value
         portfolio_value += daily_pnl
-        daily_return = daily_pnl / (portfolio_value - daily_pnl) if (portfolio_value - daily_pnl) > 0 else 0
+        daily_return = daily_pnl / prev_value if prev_value > 0 else 0
         daily_returns.append(daily_return)
 
         if daily_return > 0:
@@ -93,6 +126,8 @@ def run_backtest_v2(
         drawdown = (peak_value - portfolio_value) / peak_value if peak_value > 0 else 0
         if drawdown > max_drawdown:
             max_drawdown = drawdown
+
+        prev_positions = current_positions
 
     # Calculate metrics
     total_return = (portfolio_value - capital) / capital
@@ -119,6 +154,8 @@ def run_backtest_v2(
         "win_rate": round(win_rate * 100, 2),
         "final_value": round(portfolio_value, 2),
         "initial_capital": capital,
+        "total_transaction_costs": round(total_costs, 2),
+        "transaction_cost_rate": TRANSACTION_COST,
         "days": days,
         "tickers": tickers,
         "daily_returns_count": len(daily_returns),
@@ -130,6 +167,7 @@ def run_backtest_v2(
         sharpe=result["sharpe_ratio"],
         max_dd=result["max_drawdown"],
         win_rate=result["win_rate"],
+        total_costs=result["total_transaction_costs"],
     )
 
     return result

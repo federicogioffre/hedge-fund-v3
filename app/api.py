@@ -4,10 +4,12 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from app.tasks import analyze_ticker, analyze_batch
 from app.db import get_db
-from app.models import AnalysisResult, RankingSnapshot, PnLTrack
+from app.models import AnalysisResult, RankingSnapshot, PnLTrack, SignalHistory, Snapshot
 from app.cache import get_cached_analysis, invalidate_cache
 from app.risk_engine import compute_risk
 from app.signal_blender import blend_signals
+from app.signal_temporal import compute_signal_momentum
+from app.regime import detect_regime
 from app.portfolio_engine import construct_portfolio
 from app.backtest import run_backtest_v2
 from app.data_bundle import DataBundle
@@ -20,6 +22,8 @@ import asyncio
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+MAX_TICKERS = 25
 
 
 # --- Request/Response schemas ---
@@ -194,10 +198,20 @@ def get_analysis_by_ticker(
 def get_ranking(
     limit: int = Query(default=25, ge=1, le=100),
 ):
+    """
+    Ranking endpoint with conviction-based sorting.
+    Hardened: max 25 tickers, per-ticker error handling.
+    """
+    if limit > MAX_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {MAX_TICKERS} tickers allowed in ranking",
+        )
+
     with get_db() as session:
         from sqlalchemy import func, desc
 
-        # Get latest analysis per ticker (max 25)
+        # Get latest analysis per ticker
         subquery = (
             session.query(
                 AnalysisResult.ticker,
@@ -217,54 +231,95 @@ def get_ranking(
         )
 
         ranking = []
-        for rank, r in enumerate(records, 1):
-            # Parse agent_results to extract blended/risk if stored
-            agent_data = r.agent_results or []
-            blended_score = None
-            risk_score = None
+        errors = []
 
-            # Try to reconstruct blended and risk from agent_results
-            if agent_data:
-                scores = [a.get("score", 3.0) for a in agent_data]
-                confidences = [a.get("confidence", 0.5) for a in agent_data]
-                risks = [a.get("risk", 0.3) for a in agent_data]
+        for rank_idx, r in enumerate(records, 1):
+            try:
+                agent_data = r.agent_results or []
+                blended_score = None
+                risk_score = None
 
-                if scores:
-                    blended_score = round(sum(scores) / len(scores), 2)
-                if risks:
-                    risk_score = round(sum(risks) / len(risks), 3)
+                if agent_data:
+                    scores = [a.get("score", 3.0) for a in agent_data]
+                    risks = [a.get("risk", 0.3) for a in agent_data]
 
-            # Conviction = score * confidence * (1 - risk)
-            conviction = r.conviction
-            if conviction is None and r.overall_score and r.confidence:
-                avg_risk = risk_score or 0.3
-                conviction = round(
-                    r.overall_score * r.confidence * (1 - avg_risk), 2
-                )
+                    if scores:
+                        blended_score = round(sum(scores) / len(scores), 2)
+                    if risks:
+                        risk_score = round(sum(risks) / len(risks), 3)
 
-            ranking.append(
-                {
-                    "rank": rank,
+                # Get momentum from signal_history
+                momentum = None
+                acceleration = None
+                try:
+                    history = (
+                        session.query(SignalHistory)
+                        .filter_by(ticker=r.ticker)
+                        .order_by(SignalHistory.created_at.desc())
+                        .limit(5)
+                        .all()
+                    )
+                    if history:
+                        history_dicts = [
+                            {"score": h.score, "confidence": h.confidence}
+                            for h in history
+                        ]
+                        temporal = compute_signal_momentum(history_dicts)
+                        momentum = temporal["momentum"]
+                        acceleration = temporal["acceleration"]
+                except Exception:
+                    pass
+
+                # Conviction: score * confidence * (1 - risk) * (1 + momentum)
+                conviction = r.conviction
+                if conviction is None and r.overall_score and r.confidence:
+                    avg_risk = risk_score or 0.3
+                    mom = momentum or 0.0
+                    conviction = round(
+                        r.overall_score
+                        * r.confidence
+                        * (1 - avg_risk)
+                        * (1 + max(-0.5, min(0.5, mom))),
+                        3,
+                    )
+
+                ranking.append({
+                    "rank": rank_idx,
                     "ticker": r.ticker,
                     "overall_score": r.overall_score,
                     "blended_score": blended_score,
                     "confidence": r.confidence,
                     "conviction": conviction,
                     "risk_score": risk_score,
+                    "momentum": momentum,
+                    "acceleration": acceleration,
                     "recommendation": r.recommendation,
                     "model_version": r.model_version,
                     "analyzed_at": r.created_at.isoformat()
                     if r.created_at
                     else None,
-                }
-            )
+                })
+            except Exception as e:
+                logger.error(
+                    "ranking_ticker_error",
+                    ticker=r.ticker if r else "unknown",
+                    error=str(e),
+                )
+                errors.append({
+                    "ticker": r.ticker if r else "unknown",
+                    "error": str(e),
+                })
 
-        return {
+        result = {
             "ranking": ranking,
             "count": len(ranking),
             "model_version": MODEL_VERSION,
             "timestamp": datetime.utcnow().isoformat(),
         }
+        if errors:
+            result["errors"] = errors
+
+        return result
 
 
 @router.delete("/cache/{ticker}")
@@ -274,7 +329,7 @@ def clear_cache(ticker: str):
     return {"message": f"Cache cleared for {ticker}"}
 
 
-# --- V5 NEW ENDPOINTS ---
+# --- V5 ENDPOINTS ---
 
 
 def _run_async(coro):
@@ -298,8 +353,11 @@ def get_portfolio(
 ):
     """Construct portfolio from given tickers using latest analysis data."""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    if not ticker_list or len(ticker_list) > 25:
-        raise HTTPException(status_code=400, detail="Provide 1-25 tickers")
+    if not ticker_list or len(ticker_list) > MAX_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provide 1-{MAX_TICKERS} tickers",
+        )
 
     # Gather latest analysis for each ticker from DB
     rankings = []
@@ -343,10 +401,13 @@ def backtest_v2(
     days: int = Query(default=30, ge=1, le=365),
     capital: float = Query(default=100_000.0, ge=1000),
 ):
-    """Run backtest V2 simulation."""
+    """Run backtest V2 simulation with transaction costs and slippage."""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    if not ticker_list or len(ticker_list) > 25:
-        raise HTTPException(status_code=400, detail="Provide 1-25 tickers")
+    if not ticker_list or len(ticker_list) > MAX_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provide 1-{MAX_TICKERS} tickers",
+        )
 
     result = run_backtest_v2(ticker_list, days=days, capital=capital)
     result["model_version"] = MODEL_VERSION
@@ -374,12 +435,14 @@ def get_risk(
 
         risk_metrics = compute_risk(bundle, valid_results)
         blended = blend_signals(valid_results)
+        regime = detect_regime(bundle)
 
         return {
             "ticker": ticker,
             "asset_type": asset_type,
             "risk_metrics": risk_metrics,
             "blended_signal": blended,
+            "regime": regime,
             "model_version": MODEL_VERSION,
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -428,8 +491,11 @@ def simulate_pnl(
 ):
     """Run PnL simulation and store results."""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    if not ticker_list or len(ticker_list) > 25:
-        raise HTTPException(status_code=400, detail="Provide 1-25 tickers")
+    if not ticker_list or len(ticker_list) > MAX_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provide 1-{MAX_TICKERS} tickers",
+        )
 
     return _update_pnl_simulation(ticker_list, capital)
 
@@ -464,16 +530,7 @@ def _update_pnl_simulation(
                 })
 
     if not rankings:
-        # Simulated entries if no analysis exists
         for ticker in tickers:
-            seed = int(hashlib.md5(ticker.encode()).hexdigest()[:8], 16)
-            rng = random.Random(seed)
-            entry_price = 50 + rng.random() * 450
-            current_price = entry_price * (1 + rng.gauss(0.01, 0.05))
-            size = capital / len(tickers)
-            pnl = size * (current_price - entry_price) / entry_price
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100
-
             rankings.append({
                 "ticker": ticker,
                 "overall_score": 3.0,
@@ -531,3 +588,81 @@ def _update_pnl_simulation(
         "capital": capital,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+# --- V5.1 ENDPOINTS ---
+
+
+@router.get("/snapshots/{ticker}")
+def get_snapshots(
+    ticker: str,
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    """Get DataBundle snapshots for a ticker."""
+    ticker = ticker.upper().strip()
+    with get_db() as session:
+        records = (
+            session.query(Snapshot)
+            .filter_by(ticker=ticker)
+            .order_by(Snapshot.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "ticker": ticker,
+            "snapshots": [
+                {
+                    "id": r.id,
+                    "horizon": r.horizon,
+                    "data": r.data_json,
+                    "model_version": r.model_version,
+                    "created_at": r.created_at.isoformat()
+                    if r.created_at
+                    else None,
+                }
+                for r in records
+            ],
+            "count": len(records),
+        }
+
+
+@router.get("/signals/{ticker}")
+def get_signal_history(
+    ticker: str,
+    agent: str = Query(default=None, description="Filter by agent name"),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Get signal history for a ticker."""
+    ticker = ticker.upper().strip()
+    with get_db() as session:
+        query = (
+            session.query(SignalHistory)
+            .filter_by(ticker=ticker)
+        )
+        if agent:
+            query = query.filter_by(agent_name=agent)
+
+        records = (
+            query.order_by(SignalHistory.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "ticker": ticker,
+            "signals": [
+                {
+                    "id": r.id,
+                    "agent_name": r.agent_name,
+                    "score": r.score,
+                    "confidence": r.confidence,
+                    "risk": r.risk,
+                    "momentum": r.momentum,
+                    "acceleration": r.acceleration,
+                    "created_at": r.created_at.isoformat()
+                    if r.created_at
+                    else None,
+                }
+                for r in records
+            ],
+            "count": len(records),
+        }

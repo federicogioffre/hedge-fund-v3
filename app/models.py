@@ -69,7 +69,7 @@ class RankingSnapshot(Base):
     model_version = Column(String(20), nullable=False)
 
 
-# --- V5 NEW TABLES (additive only) ---
+# --- V5 TABLES ---
 
 
 class PnLTrack(Base):
@@ -83,4 +83,37 @@ class PnLTrack(Base):
     current_price = Column(Float, nullable=False)
     pnl = Column(Float, nullable=False)
     pnl_pct = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+# --- V5.1 NEW TABLES (additive only) ---
+
+
+class SignalHistory(Base):
+    __tablename__ = "signal_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    agent_name = Column(String(50), nullable=False, index=True)
+    score = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+    risk = Column(Float, nullable=False)
+    momentum = Column(Float, nullable=True)
+    acceleration = Column(Float, nullable=True)
+    request_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_signal_ticker_agent_created", "ticker", "agent_name", "created_at"),
+    )
+
+
+class Snapshot(Base):
+    __tablename__ = "snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    horizon = Column(String(20), nullable=False, default="default")
+    data_json = Column(JSON, nullable=False)
+    model_version = Column(String(20), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
