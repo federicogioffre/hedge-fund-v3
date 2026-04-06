@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from typing import Literal
 from app.celery_app import celery_app
 from app.context import AnalysisContext
 from app.coordinator import run_analysis
@@ -26,9 +27,19 @@ def _run_async(coro):
 
 
 @celery_app.task(bind=True, name="app.tasks.analyze_ticker")
-def analyze_ticker(self, ticker: str, user_id: str | None = None):
+def analyze_ticker(
+    self,
+    ticker: str,
+    user_id: str | None = None,
+    asset_type: str = "equity",
+):
     request_id = self.request.id or str(uuid.uuid4())
-    logger.info("task_started", ticker=ticker, request_id=request_id)
+    logger.info(
+        "task_started",
+        ticker=ticker,
+        request_id=request_id,
+        asset_type=asset_type,
+    )
 
     # Create pending record
     try:
@@ -47,6 +58,7 @@ def analyze_ticker(self, ticker: str, user_id: str | None = None):
     ctx = AnalysisContext(
         ticker=ticker,
         request_id=request_id,
+        asset_type=asset_type,
         user_id=user_id,
     )
 
@@ -71,10 +83,14 @@ def analyze_ticker(self, ticker: str, user_id: str | None = None):
 
 
 @celery_app.task(name="app.tasks.analyze_batch")
-def analyze_batch(tickers: list[str], user_id: str | None = None):
-    logger.info("batch_started", tickers=tickers)
+def analyze_batch(
+    tickers: list[str],
+    user_id: str | None = None,
+    asset_type: str = "equity",
+):
+    logger.info("batch_started", tickers=tickers, asset_type=asset_type)
     task_ids = []
     for ticker in tickers:
-        task = analyze_ticker.delay(ticker, user_id)
+        task = analyze_ticker.delay(ticker, user_id, asset_type)
         task_ids.append({"ticker": ticker, "task_id": task.id})
     return task_ids

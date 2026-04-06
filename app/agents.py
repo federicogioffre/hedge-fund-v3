@@ -1,3 +1,4 @@
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -7,6 +8,7 @@ from app.logging import get_logger
 logger = get_logger(__name__)
 
 FALLBACK_SCORE = 3.0
+AGENT_TIMEOUT_S = 3.0
 
 
 class AgentResult:
@@ -47,7 +49,9 @@ class BaseAgent(ABC):
     async def safe_analyze(self, bundle: DataBundle) -> AgentResult:
         start = time.time()
         try:
-            result = await self.analyze(bundle)
+            result = await asyncio.wait_for(
+                self.analyze(bundle), timeout=AGENT_TIMEOUT_S
+            )
             duration = (time.time() - start) * 1000
             logger.info(
                 "agent_completed",
@@ -57,6 +61,23 @@ class BaseAgent(ABC):
                 duration_ms=round(duration, 2),
             )
             return result
+        except asyncio.TimeoutError:
+            duration = (time.time() - start) * 1000
+            logger.error(
+                "agent_timeout",
+                agent=self.name,
+                ticker=bundle.ticker,
+                timeout_s=AGENT_TIMEOUT_S,
+                duration_ms=round(duration, 2),
+            )
+            return AgentResult(
+                agent_name=self.name,
+                score=FALLBACK_SCORE,
+                confidence=0.3,
+                risk=0.5,
+                reasoning=f"Agent timed out after {AGENT_TIMEOUT_S}s",
+                metadata={"fallback": True, "error": "timeout"},
+            )
         except Exception as e:
             duration = (time.time() - start) * 1000
             logger.error(
@@ -119,6 +140,24 @@ class FundamentalAgent(BaseAgent):
         eps = f.get("eps")
         margin = f.get("profit_margin")
         growth = f.get("revenue_growth")
+
+        # Crypto: no mandatory fundamentals
+        if bundle.asset_type == "crypto":
+            network = f.get("network_activity", 5)
+            holders = f.get("holder_count", 50_000)
+            score = 3.0
+            if network and network > 7:
+                score += 0.5
+            if holders and holders > 100_000:
+                score += 0.3
+            return AgentResult(
+                agent_name=self.name,
+                score=score,
+                confidence=0.4,
+                risk=0.5,
+                reasoning=f"Crypto fundamentals: network={network}, holders={holders}",
+                metadata={"network_activity": network, "holder_count": holders},
+            )
 
         score = 3.0
         reasons = []
@@ -217,6 +256,11 @@ class RiskAgent(BaseAgent):
         if margin is not None and margin < 0.05:
             risk_score += 0.2
             risk_factors.append(f"Low margins ({margin:.1%})")
+
+        # Extra risk for crypto
+        if bundle.asset_type == "crypto":
+            risk_score += 0.15
+            risk_factors.append("Crypto asset (higher inherent risk)")
 
         risk = min(risk_score, 1.0)
         # Higher risk -> lower score

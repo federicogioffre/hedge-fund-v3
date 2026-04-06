@@ -1,3 +1,3 @@
-MODEL_VERSION = "v3.0"
-DATA_VERSION = "bundle_v1"
-APP_VERSION = "3.0.0"
+MODEL_VERSION = "v5.0"
+DATA_VERSION = "bundle_v2"
+APP_VERSION = "5.0.0"

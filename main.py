@@ -25,8 +25,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Hedge Fund V3",
-    description="Multi-agent stock analysis system",
+    title="Hedge Fund V5",
+    description="Multi-agent trading engine with signal blending, risk engine, and portfolio construction",
     version=APP_VERSION,
     lifespan=lifespan,
 )

@@ -67,3 +67,20 @@ class RankingSnapshot(Base):
     rank = Column(Integer, nullable=False)
     snapshot_date = Column(DateTime, default=datetime.utcnow, index=True)
     model_version = Column(String(20), nullable=False)
+
+
+# --- V5 NEW TABLES (additive only) ---
+
+
+class PnLTrack(Base):
+    __tablename__ = "pnl_tracks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    asset_type = Column(String(10), nullable=False, default="equity")
+    position_size = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    current_price = Column(Float, nullable=False)
+    pnl = Column(Float, nullable=False)
+    pnl_pct = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

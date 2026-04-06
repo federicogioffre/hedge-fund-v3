@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 from app.data_sources import fetch_market_data, fetch_news_data, fetch_fundamentals
 from app.version import DATA_VERSION
 from app.logging import get_logger
@@ -12,6 +12,7 @@ class DataBundle:
     """Loads market/news/fundamentals ONCE and shares across agents."""
 
     ticker: str
+    asset_type: Literal["equity", "crypto"] = "equity"
     market: dict[str, Any] = field(default_factory=dict)
     news: list[dict[str, Any]] = field(default_factory=list)
     fundamentals: dict[str, Any] = field(default_factory=dict)
@@ -21,13 +22,21 @@ class DataBundle:
     async def load(self) -> "DataBundle":
         if self._loaded:
             return self
-        logger.info("data_bundle_loading", ticker=self.ticker)
+        logger.info(
+            "data_bundle_loading",
+            ticker=self.ticker,
+            asset_type=self.asset_type,
+        )
         import asyncio
 
-        market_task = asyncio.create_task(fetch_market_data(self.ticker))
-        news_task = asyncio.create_task(fetch_news_data(self.ticker))
+        market_task = asyncio.create_task(
+            fetch_market_data(self.ticker, self.asset_type)
+        )
+        news_task = asyncio.create_task(
+            fetch_news_data(self.ticker, self.asset_type)
+        )
         fundamentals_task = asyncio.create_task(
-            fetch_fundamentals(self.ticker)
+            fetch_fundamentals(self.ticker, self.asset_type)
         )
 
         self.market, self.news, self.fundamentals = await asyncio.gather(
@@ -40,6 +49,7 @@ class DataBundle:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ticker": self.ticker,
+            "asset_type": self.asset_type,
             "market": self.market,
             "news": self.news,
             "fundamentals": self.fundamentals,

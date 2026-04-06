@@ -1,13 +1,18 @@
 import httpx
-from typing import Any
+from typing import Any, Literal
 from app.config import get_settings
 from app.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-async def fetch_market_data(ticker: str) -> dict[str, Any]:
+async def fetch_market_data(
+    ticker: str, asset_type: Literal["equity", "crypto"] = "equity"
+) -> dict[str, Any]:
     """Fetch market/price data for a ticker."""
+    if asset_type == "crypto":
+        return _simulated_crypto_market(ticker)
+
     settings = get_settings()
     try:
         if settings.alpha_vantage_api_key:
@@ -31,17 +36,27 @@ async def fetch_market_data(ticker: str) -> dict[str, Any]:
                     "volume": int(quote.get("06. volume", 0)),
                     "high": float(quote.get("03. high", 0)),
                     "low": float(quote.get("04. low", 0)),
+                    "volatility": abs(
+                        float(
+                            quote.get("10. change percent", "0").rstrip("%")
+                        )
+                    )
+                    * 0.5,
                     "source": "alpha_vantage",
                 }
     except Exception as e:
         logger.warning("market_data_fetch_error", ticker=ticker, error=str(e))
 
-    # Fallback: simulated data
     return _simulated_market_data(ticker)
 
 
-async def fetch_news_data(ticker: str) -> list[dict[str, Any]]:
+async def fetch_news_data(
+    ticker: str, asset_type: Literal["equity", "crypto"] = "equity"
+) -> list[dict[str, Any]]:
     """Fetch recent news for a ticker."""
+    if asset_type == "crypto":
+        return _simulated_crypto_news(ticker)
+
     settings = get_settings()
     try:
         if settings.news_api_key:
@@ -73,8 +88,13 @@ async def fetch_news_data(ticker: str) -> list[dict[str, Any]]:
     return _simulated_news_data(ticker)
 
 
-async def fetch_fundamentals(ticker: str) -> dict[str, Any]:
+async def fetch_fundamentals(
+    ticker: str, asset_type: Literal["equity", "crypto"] = "equity"
+) -> dict[str, Any]:
     """Fetch fundamental data for a ticker."""
+    if asset_type == "crypto":
+        return _simulated_crypto_fundamentals(ticker)
+
     settings = get_settings()
     try:
         if settings.alpha_vantage_api_key:
@@ -124,12 +144,15 @@ def _simulated_market_data(ticker: str) -> dict[str, Any]:
     import hashlib
 
     h = int(hashlib.md5(ticker.encode()).hexdigest()[:8], 16)
+    price = 100 + (h % 900)
+    change_pct = round(((h % 200) - 100) / 20, 2)
     return {
-        "price": 100 + (h % 900),
-        "change_pct": round(((h % 200) - 100) / 20, 2),
+        "price": price,
+        "change_pct": change_pct,
         "volume": 1_000_000 + (h % 9_000_000),
-        "high": 100 + (h % 900) + 5,
-        "low": 100 + (h % 900) - 5,
+        "high": price + 5,
+        "low": price - 5,
+        "volatility": round(abs(change_pct) * 0.5, 2),
         "source": "simulated",
     }
 
@@ -166,4 +189,61 @@ def _simulated_fundamentals(ticker: str) -> dict[str, Any]:
         "revenue_growth": round(((h % 40) - 10) / 100, 4),
         "debt_to_equity": round((h % 200) / 100, 2),
         "source": "simulated",
+    }
+
+
+# --- CRYPTO MOCKS (higher volatility, no mandatory fundamentals) ---
+
+
+def _simulated_crypto_market(ticker: str) -> dict[str, Any]:
+    import hashlib
+
+    h = int(hashlib.md5(ticker.encode()).hexdigest()[:8], 16)
+    price = 50 + (h % 50000)
+    change_pct = round(((h % 400) - 200) / 20, 2)  # wider range ±10%
+    return {
+        "price": price,
+        "change_pct": change_pct,
+        "volume": 5_000_000 + (h % 50_000_000),
+        "high": price + price * 0.05,
+        "low": price - price * 0.05,
+        "volatility": round(abs(change_pct) * 1.2, 2),  # higher vol
+        "source": "simulated_crypto",
+    }
+
+
+def _simulated_crypto_news(ticker: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "title": f"{ticker} crypto momentum builds amid adoption",
+            "description": "Institutional interest grows.",
+            "published_at": "2024-01-15T10:00:00Z",
+            "source": "simulated_crypto",
+            "sentiment": 0.5,
+        },
+        {
+            "title": f"{ticker} network activity surges",
+            "description": "On-chain metrics show growth.",
+            "published_at": "2024-01-14T08:00:00Z",
+            "source": "simulated_crypto",
+            "sentiment": 0.3,
+        },
+    ]
+
+
+def _simulated_crypto_fundamentals(ticker: str) -> dict[str, Any]:
+    import hashlib
+
+    h = int(hashlib.md5(ticker.encode()).hexdigest()[:8], 16)
+    return {
+        "pe_ratio": None,
+        "eps": None,
+        "market_cap": (h % 300) * 1_000_000_000,
+        "dividend_yield": None,
+        "profit_margin": None,
+        "revenue_growth": None,
+        "debt_to_equity": None,
+        "network_activity": round((h % 100) / 10, 1),
+        "holder_count": 10_000 + (h % 1_000_000),
+        "source": "simulated_crypto",
     }
