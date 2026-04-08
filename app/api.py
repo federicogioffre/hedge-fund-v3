@@ -4,9 +4,24 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from app.tasks import analyze_ticker, analyze_batch
 from app.db import get_db
-from app.models import AnalysisResult, RankingSnapshot, PnLTrack, SignalHistory, Snapshot
+from app.models import (
+    AnalysisResult,
+    RankingSnapshot,
+    PnLTrack,
+    SignalHistory,
+    Snapshot,
+    FundState,
+)
 from app.cache import get_cached_analysis, invalidate_cache
+from app.config import get_settings
 from app.risk_engine import compute_risk
+from app.risk_guards import (
+    compute_fund_state,
+    halt_trading,
+    resume_trading,
+)
+from app.execution_engine import ExecutionEngine
+from app.rebalancer import rebalance as run_rebalance
 from app.signal_blender import blend_signals
 from app.signal_temporal import compute_signal_momentum
 from app.regime import detect_regime
@@ -347,11 +362,67 @@ def _run_async(coro):
 
 @router.get("/portfolio")
 def get_portfolio(
-    tickers: str = Query(..., description="Comma-separated tickers, e.g. AAPL,MSFT"),
+    tickers: str | None = Query(
+        default=None,
+        description=(
+            "Optional comma-separated tickers. If provided, constructs a "
+            "target portfolio from analysis (backward-compat V5). "
+            "If omitted, returns the live fund state and positions."
+        ),
+    ),
     capital: float = Query(default=100_000.0, ge=1000),
     asset_type: Literal["equity", "crypto"] = "equity",
 ):
-    """Construct portfolio from given tickers using latest analysis data."""
+    """
+    Portfolio endpoint.
+
+    * Without `tickers`: returns live fund portfolio (V6): cash, equity,
+      positions, PnL, drawdown.
+    * With `tickers`: constructs a target portfolio from analysis data
+      (V5 behavior, backward-compatible).
+    """
+    # V6: live fund portfolio when no tickers are provided
+    if not tickers:
+        settings = get_settings()
+        trading_mode = settings.trading_mode
+        engine = ExecutionEngine(trading_mode=trading_mode)
+        positions = engine.get_positions()
+
+        with get_db() as session:
+            snapshot = compute_fund_state(session, trading_mode)
+            latest_state = (
+                session.query(FundState)
+                .filter_by(trading_mode=trading_mode)
+                .order_by(FundState.created_at.desc())
+                .first()
+            )
+
+        return {
+            "mode": "live",
+            "trading_mode": trading_mode,
+            "cash": snapshot["cash"],
+            "equity": snapshot["equity"],
+            "total_market_value": snapshot["total_market_value"],
+            "total_cost_basis": snapshot["total_cost_basis"],
+            "total_realized_pnl": snapshot["total_realized_pnl"],
+            "total_unrealized_pnl": snapshot["total_unrealized_pnl"],
+            "peak_equity": snapshot["peak_equity"],
+            "drawdown_pct": snapshot["drawdown_pct"],
+            "daily_pnl": snapshot["daily_pnl"],
+            "position_count": snapshot["position_count"],
+            "positions": positions,
+            "trading_halted": (
+                latest_state.trading_halted if latest_state else False
+            ),
+            "halt_reason": (
+                latest_state.halt_reason if latest_state else None
+            ),
+            "initial_capital": settings.initial_capital,
+            "model_version": MODEL_VERSION,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    # V5 behavior: build a target portfolio from ranked tickers
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if not ticker_list or len(ticker_list) > MAX_TICKERS:
         raise HTTPException(
@@ -359,7 +430,6 @@ def get_portfolio(
             detail=f"Provide 1-{MAX_TICKERS} tickers",
         )
 
-    # Gather latest analysis for each ticker from DB
     rankings = []
     with get_db() as session:
         for ticker in ticker_list:
@@ -390,9 +460,75 @@ def get_portfolio(
         )
 
     portfolio = construct_portfolio(rankings, capital)
+    portfolio["mode"] = "target"
     portfolio["model_version"] = MODEL_VERSION
     portfolio["timestamp"] = datetime.utcnow().isoformat()
     return portfolio
+
+
+@router.get("/positions")
+def get_positions():
+    """Return the current live positions from the execution engine."""
+    settings = get_settings()
+    engine = ExecutionEngine(trading_mode=settings.trading_mode)
+    positions = engine.get_positions()
+    return {
+        "trading_mode": settings.trading_mode,
+        "positions": positions,
+        "count": len(positions),
+        "model_version": MODEL_VERSION,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+class RebalanceRequest(BaseModel):
+    tickers: list[str] | None = None
+    capital: float | None = None
+    dry_run: bool = False
+
+
+@router.post("/rebalance")
+def rebalance_endpoint(req: RebalanceRequest | None = None):
+    """
+    Rebalance the fund toward the target portfolio built from latest rankings.
+
+    Applies:
+        - REBALANCE_THRESHOLD_PCT: skip deltas below threshold
+        - Fund-level risk guards (drawdown, daily loss, position size)
+        - Idempotent order execution
+    """
+    payload = req or RebalanceRequest()
+    if payload.tickers and len(payload.tickers) > MAX_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {MAX_TICKERS} tickers allowed",
+        )
+
+    return _run_async(
+        run_rebalance(
+            tickers=payload.tickers,
+            capital=payload.capital,
+            dry_run=payload.dry_run,
+        )
+    )
+
+
+class HaltRequest(BaseModel):
+    reason: str
+
+
+@router.post("/risk/halt")
+def halt_endpoint(req: HaltRequest):
+    """Manually halt trading (sets trading_halted flag on fund_state)."""
+    halt_trading(req.reason)
+    return {"status": "halted", "reason": req.reason}
+
+
+@router.post("/risk/resume")
+def resume_endpoint():
+    """Resume trading (clears trading_halted flag)."""
+    resume_trading()
+    return {"status": "resumed"}
 
 
 @router.get("/backtest-v2")
@@ -454,34 +590,69 @@ def get_risk(
 def get_pnl(
     limit: int = Query(default=50, ge=1, le=200),
 ):
-    """Get PnL tracking records."""
+    """
+    Get PnL summary.
+
+    Returns:
+        - Live totals from fund_state (realized, unrealized, daily, drawdown)
+        - Current live positions with unrealized PnL
+        - Historical PnLTrack records (backward-compat with V5)
+    """
+    settings = get_settings()
+    trading_mode = settings.trading_mode
+    engine = ExecutionEngine(trading_mode=trading_mode)
+    live_positions = engine.get_positions()
+
     with get_db() as session:
+        snapshot = compute_fund_state(session, trading_mode)
         records = (
             session.query(PnLTrack)
             .order_by(PnLTrack.created_at.desc())
             .limit(limit)
             .all()
         )
-        return {
-            "positions": [
-                {
-                    "id": r.id,
-                    "ticker": r.ticker,
-                    "asset_type": r.asset_type,
-                    "position_size": r.position_size,
-                    "entry_price": r.entry_price,
-                    "current_price": r.current_price,
-                    "pnl": r.pnl,
-                    "pnl_pct": r.pnl_pct,
-                    "created_at": r.created_at.isoformat()
-                    if r.created_at
-                    else None,
-                }
-                for r in records
-            ],
-            "count": len(records),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+        history = [
+            {
+                "id": r.id,
+                "ticker": r.ticker,
+                "asset_type": r.asset_type,
+                "position_size": r.position_size,
+                "entry_price": r.entry_price,
+                "current_price": r.current_price,
+                "pnl": r.pnl,
+                "pnl_pct": r.pnl_pct,
+                "created_at": r.created_at.isoformat()
+                if r.created_at
+                else None,
+            }
+            for r in records
+        ]
+
+    total_pnl = round(
+        snapshot["total_realized_pnl"] + snapshot["total_unrealized_pnl"], 2
+    )
+    total_pnl_pct = (
+        round(total_pnl / settings.initial_capital * 100, 3)
+        if settings.initial_capital > 0
+        else 0.0
+    )
+
+    return {
+        "trading_mode": trading_mode,
+        "equity": snapshot["equity"],
+        "cash": snapshot["cash"],
+        "total_realized_pnl": snapshot["total_realized_pnl"],
+        "total_unrealized_pnl": snapshot["total_unrealized_pnl"],
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl_pct,
+        "daily_pnl": snapshot["daily_pnl"],
+        "drawdown_pct": snapshot["drawdown_pct"],
+        "peak_equity": snapshot["peak_equity"],
+        "live_positions": live_positions,
+        "positions": history,  # backward-compat V5 shape
+        "count": len(history),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 @router.post("/pnl/simulate")
