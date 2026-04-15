@@ -11,3 +11,13 @@ httpx==0.27.0
 python-dotenv==1.0.1
 tenacity==8.4.1
 structlog==24.2.0
+
+# --- V7: TradingAgents (optional LLM signal provider) ---
+# Install separately only when TRADINGAGENTS_ENABLED=true and
+# TRADINGAGENTS_PROVIDER != mock. Kept out of the default pin set so the
+# core build remains small and LLM SDKs aren't a hard dependency.
+#
+#   tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git
+#   openai>=1.40.0
+#   anthropic>=0.34.0
+#   google-generativeai>=0.7.0
