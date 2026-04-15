@@ -41,6 +41,8 @@ class AgentResult:
 
 class BaseAgent(ABC):
     name: str = "base"
+    # Per-agent override; subclasses can raise/lower this.
+    timeout_s: float = AGENT_TIMEOUT_S
 
     @abstractmethod
     async def analyze(self, bundle: DataBundle) -> AgentResult:
@@ -48,9 +50,10 @@ class BaseAgent(ABC):
 
     async def safe_analyze(self, bundle: DataBundle) -> AgentResult:
         start = time.time()
+        timeout = getattr(self, "timeout_s", AGENT_TIMEOUT_S)
         try:
             result = await asyncio.wait_for(
-                self.analyze(bundle), timeout=AGENT_TIMEOUT_S
+                self.analyze(bundle), timeout=timeout
             )
             duration = (time.time() - start) * 1000
             logger.info(
@@ -67,7 +70,7 @@ class BaseAgent(ABC):
                 "agent_timeout",
                 agent=self.name,
                 ticker=bundle.ticker,
-                timeout_s=AGENT_TIMEOUT_S,
+                timeout_s=timeout,
                 duration_ms=round(duration, 2),
             )
             return AgentResult(
@@ -75,7 +78,7 @@ class BaseAgent(ABC):
                 score=FALLBACK_SCORE,
                 confidence=0.3,
                 risk=0.5,
-                reasoning=f"Agent timed out after {AGENT_TIMEOUT_S}s",
+                reasoning=f"Agent timed out after {timeout}s",
                 metadata={"fallback": True, "error": "timeout"},
             )
         except Exception as e:
@@ -340,5 +343,20 @@ AGENTS: list[BaseAgent] = [
     SentimentAgent(),
     RiskAgent(),
 ]
+
+# --- V7: TradingAgents (LLM) signal provider ---
+# Loaded conditionally so the optional dep / Celery task module is only
+# imported when the feature is turned on.
+try:
+    from app.config import get_settings as _get_settings
+
+    if _get_settings().tradingagents_enabled:
+        from app.agents_llm.tradingagents_agent import TradingAgentsAgent
+
+        AGENTS.append(TradingAgentsAgent())
+        logger.info("tradingagents_agent_registered")
+except Exception as _e:  # pragma: no cover - never block boot
+    logger.warning("tradingagents_agent_load_error", error=str(_e))
+
 
 PORTFOLIO_AGENT = PortfolioAgent()
