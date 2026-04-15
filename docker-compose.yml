@@ -91,6 +91,24 @@ services:
       - .:/app
     restart: unless-stopped
 
+  # Frontend dashboard: Vite + React + TypeScript + Tailwind.
+  # The Vite dev server proxies /api requests to the FastAPI container,
+  # so the browser only needs to talk to http://localhost:5173.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://api:8000
+    depends_on:
+      - api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
