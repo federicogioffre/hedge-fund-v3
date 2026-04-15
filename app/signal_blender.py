@@ -1,12 +1,15 @@
 import math
 from typing import Any
 from app.agents import AgentResult
+from app.config import get_settings
 from app.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Agent weights for signal blending
-AGENT_WEIGHTS = {
+# Agent weights for signal blending.
+# The tradingagents weight is pulled dynamically from settings so operators
+# can A/B test without a redeploy.
+_BASE_WEIGHTS = {
     "technical": 0.3,
     "sentiment": 0.2,
     "fundamental": 0.3,
@@ -14,6 +17,21 @@ AGENT_WEIGHTS = {
 }
 
 DEFAULT_WEIGHT = 0.1
+
+
+def _agent_weights() -> dict[str, float]:
+    weights = dict(_BASE_WEIGHTS)
+    try:
+        settings = get_settings()
+        if settings.tradingagents_enabled:
+            weights["tradingagents"] = float(settings.tradingagents_weight)
+    except Exception:
+        pass
+    return weights
+
+
+# Kept for backward compatibility with any external import site
+AGENT_WEIGHTS = _BASE_WEIGHTS
 
 
 def blend_signals(signals: list[AgentResult]) -> dict[str, Any]:
@@ -44,14 +62,19 @@ def blend_signals(signals: list[AgentResult]) -> dict[str, Any]:
     weighted_confidence = 0.0
     contributions = {}
 
+    weights = _agent_weights()
     for s in signals:
-        w = AGENT_WEIGHTS.get(s.agent_name, DEFAULT_WEIGHT)
+        w = weights.get(s.agent_name, DEFAULT_WEIGHT)
+        # Down-weight fallback signals (e.g. TradingAgents cache miss)
+        # so they don't dominate when the real signal isn't there yet.
+        if s.metadata and s.metadata.get("fallback"):
+            w *= 0.25
         weighted_score += s.score * w
         weighted_confidence += s.confidence * w
         total_weight += w
         contributions[s.agent_name] = {
             "score": s.score,
-            "weight": w,
+            "weight": round(w, 3),
             "weighted_contribution": round(s.score * w, 3),
         }
 

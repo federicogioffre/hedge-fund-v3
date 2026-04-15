@@ -69,6 +69,28 @@ services:
       - .:/app
     restart: unless-stopped
 
+  # V7: dedicated worker for slow LLM tasks (TradingAgents debates).
+  # Kept separate from the main worker so debate latency never blocks
+  # /analyze or /rebalance.
+  worker-llm:
+    build: .
+    command: bash scripts/start_worker_llm.sh
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://hedgefund:hedgefund@postgres:5432/hedgefund
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:

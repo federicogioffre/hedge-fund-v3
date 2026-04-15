@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from typing import Literal
 from app.celery_app import celery_app
+from app.config import get_settings
 from app.context import AnalysisContext
 from app.coordinator import run_analysis
 from app.db import get_db
@@ -10,6 +11,25 @@ from app.version import MODEL_VERSION, DATA_VERSION
 from app.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _maybe_trigger_tradingagents_refresh(
+    ticker: str, asset_type: str
+) -> None:
+    """Fire-and-forget: schedule a TradingAgents signal refresh if enabled."""
+    try:
+        settings = get_settings()
+        if not settings.tradingagents_enabled:
+            return
+        from app.tasks_llm import generate_tradingagents_signal
+
+        generate_tradingagents_signal.delay(ticker.upper(), asset_type)
+    except Exception as e:
+        logger.warning(
+            "tradingagents_refresh_trigger_error",
+            ticker=ticker,
+            error=str(e),
+        )
 
 
 def _run_async(coro):
@@ -64,6 +84,9 @@ def analyze_ticker(
 
     try:
         result = _run_async(run_analysis(ctx))
+        # V7: always request a fresh TradingAgents signal after an analyze;
+        # the task is idempotent and skips if still within TTL.
+        _maybe_trigger_tradingagents_refresh(ticker, asset_type)
         return result
     except Exception as e:
         logger.error("task_failed", ticker=ticker, error=str(e))

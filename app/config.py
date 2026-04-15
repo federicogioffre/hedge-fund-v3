@@ -39,6 +39,20 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = 5.0  # halt if -5% in a day
     max_drawdown_pct: float = 15.0  # halt if drawdown > 15%
 
+    # --- V7 TradingAgents (LLM signal provider) ---
+    tradingagents_enabled: bool = False
+    tradingagents_provider: Literal[
+        "openai", "anthropic", "gemini", "ollama", "mock"
+    ] = "mock"
+    tradingagents_model: str = "gpt-4o-mini"
+    tradingagents_depth: int = 1  # debate rounds
+    tradingagents_cache_ttl: int = 3600  # 1h
+    tradingagents_stale_ttl: int = 86400  # 24h (beyond this: fallback)
+    tradingagents_max_concurrent: int = 2
+    tradingagents_weight: float = 0.4  # weight in signal_blender
+    tradingagents_read_timeout_s: float = 2.0  # hot path only reads cache
+    tradingagents_api_key: str = ""  # optional override
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
