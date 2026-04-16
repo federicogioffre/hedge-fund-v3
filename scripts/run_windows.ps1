@@ -70,6 +70,16 @@ function Test-Port($port) {
 Write-Host "=== Hedge Fund V7 - Local Windows Runner ===" -ForegroundColor Cyan
 Write-Host "Repo: $RepoRoot"
 
+# If a previously-created venv exists, activate it immediately so the
+# Python version gate below measures the venv's interpreter (typically
+# 3.12) rather than whatever `python` on PATH happens to be (which in
+# a fresh shell is the system Python, often the too-new 3.14).
+$activatePath = Join-Path $RepoRoot ".venv\Scripts\Activate.ps1"
+if (Test-Path $activatePath) {
+    & $activatePath
+    Write-Host "[INFO] Activated existing .venv" -ForegroundColor DarkGray
+}
+
 # ----- 1. Prerequisite binaries --------------------------------------------
 Write-Header "Checking prerequisites"
 
@@ -158,8 +168,11 @@ Write-Header "Python virtualenv"
 if (-not (Test-Path ".venv")) {
     Write-Host "Creating .venv ..."
     python -m venv .venv
+    & ".\.venv\Scripts\Activate.ps1"
 }
-& ".\.venv\Scripts\Activate.ps1"
+# If the venv existed we already activated it at the top of the script;
+# if we just created it we activated it in the block above. Either way,
+# $env:VIRTUAL_ENV is set at this point.
 
 # Fast check: can we import fastapi from the current venv?
 # Using `python -c` instead of `pip show` because pip writes WARNINGs to
