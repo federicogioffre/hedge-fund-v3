@@ -274,23 +274,32 @@ def _build_report(
 
 
 def _save_result(result: dict[str, Any]) -> None:
+    # The Celery task layer already inserts a "processing" row with this
+    # request_id at task start (see app/tasks.py:analyze_ticker), so we
+    # cannot blindly INSERT again - request_id has a UNIQUE index.
+    # Look up the existing row and update it; fall back to INSERT if the
+    # task-level pending write failed for any reason.
     try:
         with get_db() as session:
-            record = AnalysisResult(
-                request_id=result["request_id"],
-                ticker=result["ticker"],
-                status=result["status"],
-                overall_score=result["overall_score"],
-                confidence=result["confidence"],
-                recommendation=result["recommendation"],
-                conviction=result["conviction"],
-                agent_results=result["agent_results"],
-                report=result["report"],
-                model_version=result["model_version"],
-                data_version=result["data_version"],
-                completed_at=datetime.utcnow(),
+            record = (
+                session.query(AnalysisResult)
+                .filter_by(request_id=result["request_id"])
+                .first()
             )
-            session.add(record)
+            if record is None:
+                record = AnalysisResult(request_id=result["request_id"])
+                session.add(record)
+            record.ticker = result["ticker"]
+            record.status = result["status"]
+            record.overall_score = result["overall_score"]
+            record.confidence = result["confidence"]
+            record.recommendation = result["recommendation"]
+            record.conviction = result["conviction"]
+            record.agent_results = result["agent_results"]
+            record.report = result["report"]
+            record.model_version = result["model_version"]
+            record.data_version = result["data_version"]
+            record.completed_at = datetime.utcnow()
     except Exception as e:
         logger.error("db_save_error", error=str(e))
 
