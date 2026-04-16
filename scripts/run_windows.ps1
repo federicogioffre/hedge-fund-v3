@@ -28,9 +28,21 @@ Set-Location $RepoRoot
 
 # Run a native command, swallow stdout+stderr, return its exit code.
 # Used for idempotent probes where non-zero != failure.
+#
+# Windows PowerShell 5.1 turns any native-command stderr line into a
+# NativeCommandError *before* redirection takes effect, which explodes
+# under $ErrorActionPreference=Stop even when we redirect with *>$null.
+# Locally flip the preference and merge streams (2>&1) so stderr travels
+# as plain output and never reaches the error stream.
 function Invoke-NativeQuiet {
     param([scriptblock]$Cmd)
-    & $Cmd *> $null
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $null = & $Cmd 2>&1
+    } finally {
+        $ErrorActionPreference = $prev
+    }
     return $LASTEXITCODE
 }
 
@@ -110,14 +122,17 @@ if (-not (Test-Path ".venv")) {
 }
 & ".\.venv\Scripts\Activate.ps1"
 
-# Fast check: is fastapi already installed?
-$fastapiExit = Invoke-NativeQuiet { pip show fastapi }
+# Fast check: can we import fastapi from the current venv?
+# Using `python -c` instead of `pip show` because pip writes WARNINGs to
+# stderr even on success (e.g. new version available), which trips up
+# Windows PowerShell 5.1 even with stream redirection.
+$fastapiExit = Invoke-NativeQuiet { python -c "import fastapi" }
 if ($fastapiExit -ne 0) {
     Write-Host "Installing Python deps (first run, a few minutes) ..."
     python -m pip install --upgrade pip
     pip install -r requirements.txt
 } else {
-    Write-Host "[OK] Python deps already installed (skip 'pip install -r requirements.txt' to force refresh)"
+    Write-Host "[OK] Python deps already installed (delete .venv\ to force a clean reinstall)"
 }
 
 # ----- 4. .env configuration -----------------------------------------------
@@ -147,23 +162,35 @@ if (-not $env:PGPASSWORD) {
     Write-Host "[INFO] `$env:PGPASSWORD not set; will attempt psql with no password (trust auth or .pgpass)." -ForegroundColor Yellow
 }
 
+# Run psql and capture stdout as a string, never letting stderr reach
+# the PS error stream. Returns the trimmed stdout (empty string on error).
+function Invoke-Psql {
+    param([string]$Sql)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $out = & psql -U postgres -h localhost -tAc $Sql 2>&1 | Out-String
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return "$out".Trim()
+}
+
 # Create role if missing
-$roleSql    = "SELECT 1 FROM pg_roles WHERE rolname='hedgefund'"
-$roleExists = & psql -U postgres -h localhost -tAc $roleSql 2>$null
-if ("$roleExists".Trim() -ne "1") {
-    & psql -U postgres -h localhost -c "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;" *> $null
-    if ($LASTEXITCODE -eq 0) { Write-Host "[OK] role 'hedgefund' created" }
+$roleExists = Invoke-Psql "SELECT 1 FROM pg_roles WHERE rolname='hedgefund'"
+if ($roleExists -ne "1") {
+    $rc = Invoke-NativeQuiet { psql -U postgres -h localhost -c "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;" }
+    if ($rc -eq 0) { Write-Host "[OK] role 'hedgefund' created" }
     else { Write-Host "[WARN] could not create role; if it already exists this is fine." -ForegroundColor Yellow }
 } else {
     Write-Host "[OK] role 'hedgefund' exists"
 }
 
 # Create DB if missing
-$dbSql    = "SELECT 1 FROM pg_database WHERE datname='hedgefund'"
-$dbExists = & psql -U postgres -h localhost -tAc $dbSql 2>$null
-if ("$dbExists".Trim() -ne "1") {
-    & psql -U postgres -h localhost -c "CREATE DATABASE hedgefund OWNER hedgefund;" *> $null
-    if ($LASTEXITCODE -eq 0) { Write-Host "[OK] database 'hedgefund' created" }
+$dbExists = Invoke-Psql "SELECT 1 FROM pg_database WHERE datname='hedgefund'"
+if ($dbExists -ne "1") {
+    $rc = Invoke-NativeQuiet { psql -U postgres -h localhost -c "CREATE DATABASE hedgefund OWNER hedgefund;" }
+    if ($rc -eq 0) { Write-Host "[OK] database 'hedgefund' created" }
     else { Write-Host "[WARN] could not create DB; check `$env:PGPASSWORD and pg_hba.conf." -ForegroundColor Yellow }
 } else {
     Write-Host "[OK] database 'hedgefund' exists"
