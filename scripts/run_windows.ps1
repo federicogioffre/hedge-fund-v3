@@ -16,10 +16,23 @@
 # Close the windows (or Ctrl+C inside) to stop the services.
 
 $ErrorActionPreference = "Stop"
+# PowerShell 7.3+ makes native command non-zero exit codes throw when
+# $ErrorActionPreference is "Stop". We call tools like `pip show` and
+# `psql -tAc` whose non-zero exits are informational (package missing,
+# no rows), not failures, so opt out of that behaviour globally.
+$PSNativeCommandUseErrorActionPreference = $false
 
 # Resolve repo root (scripts/ -> ..)
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
+
+# Run a native command, swallow stdout+stderr, return its exit code.
+# Used for idempotent probes where non-zero != failure.
+function Invoke-NativeQuiet {
+    param([scriptblock]$Cmd)
+    & $Cmd *> $null
+    return $LASTEXITCODE
+}
 
 function Write-Header($msg) {
     Write-Host ""
@@ -98,8 +111,8 @@ if (-not (Test-Path ".venv")) {
 & ".\.venv\Scripts\Activate.ps1"
 
 # Fast check: is fastapi already installed?
-$null = pip show fastapi 2>$null
-if ($LASTEXITCODE -ne 0) {
+$fastapiExit = Invoke-NativeQuiet { pip show fastapi }
+if ($fastapiExit -ne 0) {
     Write-Host "Installing Python deps (first run, a few minutes) ..."
     python -m pip install --upgrade pip
     pip install -r requirements.txt
@@ -135,10 +148,10 @@ if (-not $env:PGPASSWORD) {
 }
 
 # Create role if missing
-$roleSql = "SELECT 1 FROM pg_roles WHERE rolname='hedgefund'"
-$roleExists = (& psql -U postgres -h localhost -tAc $roleSql) 2>$null
-if ($roleExists -ne "1") {
-    & psql -U postgres -h localhost -c "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;" | Out-Null
+$roleSql    = "SELECT 1 FROM pg_roles WHERE rolname='hedgefund'"
+$roleExists = & psql -U postgres -h localhost -tAc $roleSql 2>$null
+if ("$roleExists".Trim() -ne "1") {
+    & psql -U postgres -h localhost -c "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;" *> $null
     if ($LASTEXITCODE -eq 0) { Write-Host "[OK] role 'hedgefund' created" }
     else { Write-Host "[WARN] could not create role; if it already exists this is fine." -ForegroundColor Yellow }
 } else {
@@ -146,10 +159,10 @@ if ($roleExists -ne "1") {
 }
 
 # Create DB if missing
-$dbSql = "SELECT 1 FROM pg_database WHERE datname='hedgefund'"
-$dbExists = (& psql -U postgres -h localhost -tAc $dbSql) 2>$null
-if ($dbExists -ne "1") {
-    & psql -U postgres -h localhost -c "CREATE DATABASE hedgefund OWNER hedgefund;" | Out-Null
+$dbSql    = "SELECT 1 FROM pg_database WHERE datname='hedgefund'"
+$dbExists = & psql -U postgres -h localhost -tAc $dbSql 2>$null
+if ("$dbExists".Trim() -ne "1") {
+    & psql -U postgres -h localhost -c "CREATE DATABASE hedgefund OWNER hedgefund;" *> $null
     if ($LASTEXITCODE -eq 0) { Write-Host "[OK] database 'hedgefund' created" }
     else { Write-Host "[WARN] could not create DB; check `$env:PGPASSWORD and pg_hba.conf." -ForegroundColor Yellow }
 } else {
