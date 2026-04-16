@@ -76,6 +76,13 @@ Write-Host "Repo: $RepoRoot"
 $ApiPort = if ($env:HEDGEFUND_API_PORT) { [int]$env:HEDGEFUND_API_PORT } else { 8010 }
 Write-Host "API port: $ApiPort  (override with `$env:HEDGEFUND_API_PORT)"
 
+# Frontend is opt-in. Set $env:HEDGEFUND_WITH_FRONTEND=1 (or "true")
+# to also spin up the Vite dev server on :5173.
+$WithFrontend = $env:HEDGEFUND_WITH_FRONTEND -in @("1", "true", "True", "yes")
+if ($WithFrontend) {
+    Write-Host "Frontend: ENABLED (Vite on :5173)"
+}
+
 # If a previously-created venv exists, activate it immediately so the
 # Python version gate below measures the venv's interpreter (typically
 # 3.12) rather than whatever `python` on PATH happens to be (which in
@@ -296,6 +303,27 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", $apiCmd
 Start-Sleep -Seconds 2
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $workerCmd
 
+# Optional: Vite dev server for the React dashboard.
+# Runs `npm install` on first run, then `npm run dev` with VITE_API_URL
+# pointing at our FastAPI so the browser only talks to :5173.
+if ($WithFrontend) {
+    if (-not (Get-Command "npm" -ErrorAction SilentlyContinue)) {
+        Write-Host "[WARN] npm not found; install Node.js 20 (https://nodejs.org) then rerun with `$env:HEDGEFUND_WITH_FRONTEND=1" -ForegroundColor Yellow
+    } else {
+        $feRoot  = Join-Path $RepoRoot "frontend"
+        $apiBase = "http://localhost:$ApiPort"
+        $feCmd = "Set-Location '$feRoot'; " +
+                 "`$env:VITE_API_URL='$apiBase'; " +
+                 "if (-not (Test-Path 'node_modules')) { " +
+                 "  Write-Host '=== Frontend: installing deps (one-time, ~2 min) ===' -ForegroundColor Cyan; " +
+                 "  npm install " +
+                 "}; " +
+                 "Write-Host '=== Frontend (vite :5173 -> $apiBase) ===' -ForegroundColor Cyan; " +
+                 "npm run dev"
+        Start-Process powershell -ArgumentList "-NoExit", "-Command", $feCmd
+    }
+}
+
 # ----- 7. Done --------------------------------------------------------------
 Write-Host ""
 Write-Host "===========================================" -ForegroundColor Green
@@ -304,7 +332,11 @@ Write-Host "===========================================" -ForegroundColor Green
 Write-Host "  API      http://localhost:$ApiPort"
 Write-Host "  Docs     http://localhost:$ApiPort/docs"
 Write-Host "  Health   http://localhost:$ApiPort/api/v1/health"
+if ($WithFrontend) {
+    Write-Host "  UI       http://localhost:5173" -ForegroundColor Cyan
+}
 Write-Host ""
-Write-Host "Two PowerShell windows were opened (API + worker)." -ForegroundColor Yellow
+$windowCount = if ($WithFrontend) { "Three" } else { "Two" }
+Write-Host "$windowCount PowerShell windows were opened." -ForegroundColor Yellow
 Write-Host "Close them (or Ctrl+C inside) to stop the services." -ForegroundColor Yellow
 Write-Host ""
