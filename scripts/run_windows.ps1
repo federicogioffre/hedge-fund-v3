@@ -77,14 +77,23 @@ Write-Header "Checking prerequisites"
 # leaves it in C:\Program Files\PostgreSQL\<ver>\bin\ by default. Add
 # that directory to $env:Path for the current session so the user
 # doesn't have to remember it every time they open a new shell.
+#
+# We also pin the absolute path in $script:PsqlExe and use that for
+# every psql invocation below, because empirically activating the
+# venv can shadow PATH lookups for bare command names in some
+# PowerShell configurations.
+$script:PsqlExe = "psql"
 if (-not (Get-Command "psql" -ErrorAction SilentlyContinue)) {
     $psqlCandidate = Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\psql.exe" -ErrorAction SilentlyContinue |
                      Sort-Object { [int]($_.Directory.Parent.Name) } -Descending |
                      Select-Object -First 1
     if ($psqlCandidate) {
         $env:Path += ";" + $psqlCandidate.DirectoryName
+        $script:PsqlExe = $psqlCandidate.FullName
         Write-Host "[INFO] Added $($psqlCandidate.DirectoryName) to PATH for this session" -ForegroundColor DarkGray
     }
+} else {
+    $script:PsqlExe = (Get-Command "psql").Source
 }
 
 $missing = @()
@@ -192,24 +201,41 @@ if (-not $env:PGPASSWORD) {
     Write-Host "[INFO] `$env:PGPASSWORD not set; will attempt psql with no password (trust auth or .pgpass)." -ForegroundColor Yellow
 }
 
-# Run psql and capture stdout as a string, never letting stderr reach
-# the PS error stream. Returns the trimmed stdout (empty string on error).
+# Run `psql -tAc` and capture stdout (for SELECT probes).
+# Uses the absolute path in $script:PsqlExe so venv PATH shadowing
+# cannot break the lookup.
 function Invoke-Psql {
     param([string]$Sql)
+    $exe  = $script:PsqlExe
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
     try {
-        $out = & psql -U postgres -h localhost -tAc $Sql 2>&1 | Out-String
+        $out = & $exe -U postgres -h localhost -tAc $Sql 2>&1 | Out-String
     } finally {
         $ErrorActionPreference = $prev
     }
     return "$out".Trim()
 }
 
+# Run `psql -c` (DDL/DML) and return the exit code. Output is swallowed.
+function Invoke-PsqlCommand {
+    param([string]$Sql)
+    $exe  = $script:PsqlExe
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $null = & $exe -U postgres -h localhost -c $Sql 2>&1
+        $rc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $rc
+}
+
 # Create role if missing
 $roleExists = Invoke-Psql "SELECT 1 FROM pg_roles WHERE rolname='hedgefund'"
 if ($roleExists -ne "1") {
-    $rc = Invoke-NativeQuiet { psql -U postgres -h localhost -c "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;" }
+    $rc = Invoke-PsqlCommand "CREATE ROLE hedgefund WITH LOGIN PASSWORD 'hedgefund' CREATEDB;"
     if ($rc -eq 0) { Write-Host "[OK] role 'hedgefund' created" }
     else { Write-Host "[WARN] could not create role; if it already exists this is fine." -ForegroundColor Yellow }
 } else {
@@ -219,7 +245,7 @@ if ($roleExists -ne "1") {
 # Create DB if missing
 $dbExists = Invoke-Psql "SELECT 1 FROM pg_database WHERE datname='hedgefund'"
 if ($dbExists -ne "1") {
-    $rc = Invoke-NativeQuiet { psql -U postgres -h localhost -c "CREATE DATABASE hedgefund OWNER hedgefund;" }
+    $rc = Invoke-PsqlCommand "CREATE DATABASE hedgefund OWNER hedgefund;"
     if ($rc -eq 0) { Write-Host "[OK] database 'hedgefund' created" }
     else { Write-Host "[WARN] could not create DB; check `$env:PGPASSWORD and pg_hba.conf." -ForegroundColor Yellow }
 } else {
