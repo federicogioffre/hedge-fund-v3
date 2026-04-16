@@ -70,6 +70,12 @@ function Test-Port($port) {
 Write-Host "=== Hedge Fund V7 - Local Windows Runner ===" -ForegroundColor Cyan
 Write-Host "Repo: $RepoRoot"
 
+# Pick API port. Default 8010 (not 8000) to avoid colliding with other
+# local FastAPI projects on the same machine. Override per-session by
+# setting $env:HEDGEFUND_API_PORT before running this script.
+$ApiPort = if ($env:HEDGEFUND_API_PORT) { [int]$env:HEDGEFUND_API_PORT } else { 8010 }
+Write-Host "API port: $ApiPort  (override with `$env:HEDGEFUND_API_PORT)"
+
 # If a previously-created venv exists, activate it immediately so the
 # Python version gate below measures the venv's interpreter (typically
 # 3.12) rather than whatever `python` on PATH happens to be (which in
@@ -160,6 +166,14 @@ if (Test-Port 6379) {
 } else {
     Write-Host "[WARN] Memurai not on :6379. Start it via Services.msc or 'net start Memurai' (admin)." -ForegroundColor Yellow
     exit 1
+}
+if (Test-Port $ApiPort) {
+    Write-Host "[FAIL] Port $ApiPort is already in use. Another process is bound there." -ForegroundColor Red
+    Write-Host "       Find the squatter:  Get-NetTCPConnection -LocalPort $ApiPort -State Listen" -ForegroundColor Yellow
+    Write-Host "       Or pick a different port: `$env:HEDGEFUND_API_PORT=8011; .\scripts\run_windows.ps1" -ForegroundColor Yellow
+    exit 1
+} else {
+    Write-Host "[OK] API port $ApiPort is free"
 }
 
 # ----- 3. Python virtualenv + deps -----------------------------------------
@@ -271,8 +285,8 @@ Write-Header "Starting services"
 $activate = Join-Path $RepoRoot ".venv\Scripts\Activate.ps1"
 
 $apiCmd = "Set-Location '$RepoRoot'; & '$activate'; " +
-          "Write-Host '=== API (uvicorn) ===' -ForegroundColor Cyan; " +
-          "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+          "Write-Host '=== API (uvicorn :$ApiPort) ===' -ForegroundColor Cyan; " +
+          "uvicorn main:app --host 0.0.0.0 --port $ApiPort --reload"
 
 $workerCmd = "Set-Location '$RepoRoot'; & '$activate'; " +
              "Write-Host '=== Celery worker (pool=solo) ===' -ForegroundColor Cyan; " +
@@ -287,9 +301,9 @@ Write-Host ""
 Write-Host "===========================================" -ForegroundColor Green
 Write-Host "  Hedge Fund V7 running locally" -ForegroundColor Green
 Write-Host "===========================================" -ForegroundColor Green
-Write-Host "  API      http://localhost:8000"
-Write-Host "  Docs     http://localhost:8000/docs"
-Write-Host "  Health   http://localhost:8000/api/v1/health"
+Write-Host "  API      http://localhost:$ApiPort"
+Write-Host "  Docs     http://localhost:$ApiPort/docs"
+Write-Host "  Health   http://localhost:$ApiPort/api/v1/health"
 Write-Host ""
 Write-Host "Two PowerShell windows were opened (API + worker)." -ForegroundColor Yellow
 Write-Host "Close them (or Ctrl+C inside) to stop the services." -ForegroundColor Yellow
