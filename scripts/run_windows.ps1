@@ -73,6 +73,20 @@ Write-Host "Repo: $RepoRoot"
 # ----- 1. Prerequisite binaries --------------------------------------------
 Write-Header "Checking prerequisites"
 
+# Auto-locate psql.exe if it isn't on PATH. The EnterpriseDB installer
+# leaves it in C:\Program Files\PostgreSQL\<ver>\bin\ by default. Add
+# that directory to $env:Path for the current session so the user
+# doesn't have to remember it every time they open a new shell.
+if (-not (Get-Command "psql" -ErrorAction SilentlyContinue)) {
+    $psqlCandidate = Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\psql.exe" -ErrorAction SilentlyContinue |
+                     Sort-Object { [int]($_.Directory.Parent.Name) } -Descending |
+                     Select-Object -First 1
+    if ($psqlCandidate) {
+        $env:Path += ";" + $psqlCandidate.DirectoryName
+        Write-Host "[INFO] Added $($psqlCandidate.DirectoryName) to PATH for this session" -ForegroundColor DarkGray
+    }
+}
+
 $missing = @()
 if (-not (Test-Command "python")) {
     Write-Host "[MISSING] python - install from https://www.python.org/downloads/windows/" -ForegroundColor Red
