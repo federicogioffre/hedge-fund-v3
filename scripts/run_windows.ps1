@@ -78,7 +78,23 @@ if (-not (Test-Command "python")) {
     Write-Host "[MISSING] python - install from https://www.python.org/downloads/windows/" -ForegroundColor Red
     $missing += "python"
 } else {
-    Write-Host "[OK] python"
+    # Gate on interpreter version: psycopg2-binary and pydantic-core only
+    # publish prebuilt wheels for CPython <= 3.12. Newer versions fall back
+    # to building from source, which needs MSVC + Rust and usually fails.
+    $pyVer = (& python -c "import sys;print('%d.%d' % sys.version_info[:2])" 2>$null).Trim()
+    $pyMajor = 0; $pyMinor = 0
+    if ($pyVer -match '^(\d+)\.(\d+)$') { $pyMajor = [int]$Matches[1]; $pyMinor = [int]$Matches[2] }
+
+    if ($pyMajor -eq 3 -and $pyMinor -ge 10 -and $pyMinor -le 12) {
+        Write-Host "[OK] python $pyVer"
+    } else {
+        Write-Host "[BAD] python $pyVer - supported range is 3.10-3.12." -ForegroundColor Red
+        Write-Host "      psycopg2-binary and pydantic-core have no wheels for Python $pyVer." -ForegroundColor Yellow
+        Write-Host "      Install Python 3.12 (https://www.python.org/downloads/windows/)" -ForegroundColor Yellow
+        Write-Host "      and recreate the venv with:" -ForegroundColor Yellow
+        Write-Host "        deactivate; Remove-Item -Recurse -Force .venv; py -3.12 -m venv .venv" -ForegroundColor Yellow
+        $missing += "python-version"
+    }
 }
 if (-not (Test-Command "psql")) {
     Write-Host "[MISSING] psql (PostgreSQL client) - install PostgreSQL 16" -ForegroundColor Red
