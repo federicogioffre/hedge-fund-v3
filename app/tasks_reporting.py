@@ -1,21 +1,37 @@
+import asyncio
+import uuid
+
 from app.celery_app import celery_app
 from app.config import get_settings
+from app.context import AnalysisContext
+from app.coordinator import run_analysis
 from app.db import get_db
-from app.models import AnalysisResult, FundState, Position
-from app.report_builder import build_report_html
 from app.email_service import send_email
 from app.logging import get_logger
-from celery.result import AsyncResult
-from sqlalchemy import func, desc
+from app.models import AnalysisResult, FundState, Position
+from app.report_builder import build_report_html
+from sqlalchemy import desc, func
 
 logger = get_logger(__name__)
+
+
+def _run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 @celery_app.task(
     bind=True,
     name="app.tasks_reporting.send_daily_report",
-    soft_time_limit=600,
-    time_limit=660,
+    soft_time_limit=900,
+    time_limit=960,
 )
 def send_daily_report(self):
     settings = get_settings()
@@ -28,19 +44,18 @@ def send_daily_report(self):
 
     logger.info("report_started", tickers=len(watchlist))
 
-    from app.tasks import analyze_ticker
-
-    task_map = {}
-    for ticker in watchlist:
-        task = analyze_ticker.delay(ticker)
-        task_map[ticker] = task.id
-
     completed = []
     failed = []
-    for ticker, task_id in task_map.items():
+    for ticker in watchlist:
         try:
-            AsyncResult(task_id).get(timeout=120)
+            ctx = AnalysisContext(
+                ticker=ticker,
+                request_id=str(uuid.uuid4()),
+                asset_type="equity",
+            )
+            _run_async(run_analysis(ctx))
             completed.append(ticker)
+            logger.info("report_ticker_done", ticker=ticker)
         except Exception as e:
             logger.warning("report_ticker_failed", ticker=ticker, error=str(e))
             failed.append(ticker)
