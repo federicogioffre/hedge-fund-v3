@@ -3,6 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from app.tasks import analyze_ticker, analyze_batch
+from app.tasks_reporting import send_daily_report
 from app.db import get_db
 from app.models import (
     AnalysisResult,
@@ -762,6 +763,17 @@ def _update_pnl_simulation(
 
 
 # --- V5.1 ENDPOINTS ---
+
+
+@router.post("/report/send")
+def trigger_report():
+    """Manually trigger the daily email report."""
+    task = send_daily_report.delay()
+    return {
+        "request_id": task.id,
+        "status": "queued",
+        "message": "Report generation started",
+    }
 
 
 @router.get("/snapshots/{ticker}")

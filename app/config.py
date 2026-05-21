@@ -53,6 +53,18 @@ class Settings(BaseSettings):
     tradingagents_read_timeout_s: float = 2.0  # hot path only reads cache
     tradingagents_api_key: str = ""  # optional override
 
+    # --- Email Report ---
+    smtp_enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    report_from: str = ""
+    report_recipients: str = ""
+    report_watchlist: str = "AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA,AMD,AVGO,NFLX"
+    report_hour_utc: int = 16
+    report_minute_utc: int = 0
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

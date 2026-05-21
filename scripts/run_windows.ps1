@@ -82,6 +82,10 @@ $WithFrontend = $env:HEDGEFUND_WITH_FRONTEND -in @("1", "true", "True", "yes")
 if ($WithFrontend) {
     Write-Host "Frontend: ENABLED (Vite on :5173)"
 }
+$WithBeat = $env:HEDGEFUND_WITH_BEAT -in @("1", "true", "True", "yes")
+if ($WithBeat) {
+    Write-Host "Beat:     ENABLED (scheduled tasks)"
+}
 
 # If a previously-created venv exists, activate it immediately so the
 # Python version gate below measures the venv's interpreter (typically
@@ -303,6 +307,14 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", $apiCmd
 Start-Sleep -Seconds 2
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $workerCmd
 
+# Optional: Celery Beat for scheduled tasks (daily email report).
+if ($WithBeat) {
+    $beatCmd = "Set-Location '$RepoRoot'; & '$activate'; " +
+               "Write-Host '=== Celery Beat (scheduler) ===' -ForegroundColor Cyan; " +
+               "celery -A app.celery_app beat --loglevel=info"
+    Start-Process powershell -ArgumentList "-NoExit", "-Command", $beatCmd
+}
+
 # Optional: Vite dev server for the React dashboard.
 # Runs `npm install` on first run, then `npm run dev` with VITE_API_URL
 # pointing at our FastAPI so the browser only talks to :5173.
@@ -336,7 +348,10 @@ if ($WithFrontend) {
     Write-Host "  UI       http://localhost:5173" -ForegroundColor Cyan
 }
 Write-Host ""
-$windowCount = if ($WithFrontend) { "Three" } else { "Two" }
+$extra = 0
+if ($WithFrontend) { $extra++ }
+if ($WithBeat) { $extra++ }
+$windowCount = switch (2 + $extra) { 2 { "Two" } 3 { "Three" } 4 { "Four" } }
 Write-Host "$windowCount PowerShell windows were opened." -ForegroundColor Yellow
 Write-Host "Close them (or Ctrl+C inside) to stop the services." -ForegroundColor Yellow
 Write-Host ""

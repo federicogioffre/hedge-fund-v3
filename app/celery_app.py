@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from app.config import get_settings
 
 settings = get_settings()
@@ -21,13 +22,19 @@ celery_app.conf.update(
     result_expires=3600,
     task_soft_time_limit=120,
     task_time_limit=180,
-    # V7: route slow LLM tasks to a dedicated queue so the primary
-    # worker stays responsive. Run a second worker with:
-    #   celery -A app.celery_app worker -Q llm_slow --concurrency=2
     task_routes={
         "app.tasks_llm.*": {"queue": "llm_slow"},
     },
-    task_queues=None,  # let Celery autocreate queues from routes
+    task_queues=None,
+    beat_schedule={
+        "daily-report": {
+            "task": "app.tasks_reporting.send_daily_report",
+            "schedule": crontab(
+                hour=settings.report_hour_utc,
+                minute=settings.report_minute_utc,
+            ),
+        },
+    },
 )
 
 # Task time/soft limits for LLM tasks are longer: debates can take a while.
