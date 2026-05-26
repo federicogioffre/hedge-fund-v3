@@ -45,4 +45,8 @@ celery_app.conf.task_annotations = {
     },
 }
 
-celery_app.autodiscover_tasks(["app"])
+celery_app.conf.include = [
+    "app.tasks",
+    "app.tasks_reporting",
+    "app.tasks_llm",
+]
